@@ -1,0 +1,459 @@
+name: Build Android Studio APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: 'URL ZIP project Android Studio'
+        required: true
+        type: string
+      tag:
+        description: 'Build tag'
+        required: true
+        type: string
+      build_type:
+        description: 'debug / release'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+      icon_url:
+        description: 'URL icon (opsional, kosongkan kalau gak mau ganti)'
+        required: false
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
+
+      - name: Install Android SDK + ImageMagick
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" \
+                     "platforms;android-33" "platforms;android-34" "platforms;android-35" \
+                     "build-tools;33.0.0" "build-tools;34.0.0" "build-tools;35.0.0" || true
+          sudo apt-get install -y imagemagick unzip > /dev/null 2>&1 || true
+
+      # ============================================================
+      # DOWNLOAD ZIP
+      # ============================================================
+      - name: Download project ZIP
+        run: |
+          mkdir -p project
+          cd project
+          echo "⬇️ Download: ${{ inputs.zip_url }}"
+          curl -fsSL "${{ inputs.zip_url }}" -o project.zip
+          ls -lh project.zip
+
+          SIZE=$(stat -c%s project.zip 2>/dev/null || stat -f%z project.zip)
+          if [ "$SIZE" -lt 100 ]; then
+            echo "❌ ZIP terlalu kecil ($SIZE bytes), kemungkinan corrupt."
+            file project.zip
+            exit 1
+          fi
+
+          unzip -q project.zip || {
+            echo "❌ Gagal unzip. File mungkin bukan ZIP valid."
+            file project.zip
+            exit 1
+          }
+          rm project.zip
+          echo "📁 Isi project:"
+          ls -la
+
+      # ============================================================
+      # AUTO-DETECT + VALIDASI STRICT
+      # ============================================================
+      - name: Validate & detect project root
+        id: detect
+        run: |
+          cd project
+
+          echo "🔍 Scanning project structure..."
+          echo "--- File gradle ditemukan: ---"
+          find . -maxdepth 3 \( -name "*.gradle" -o -name "*.gradle.kts" \) -type f 2>/dev/null | head -20 || true
+          echo "--- Folder 'app' ditemukan: ---"
+          find . -maxdepth 3 -type d -name "app" 2>/dev/null | head -5 || true
+          echo "--------------------------------"
+
+          WORKDIR="."
+          HAS_BUILD=false
+          HAS_SETTINGS=false
+          HAS_APP=false
+
+          check_dir() {
+            local d="$1"
+            [ -f "$d/build.gradle" ] || [ -f "$d/build.gradle.kts" ] && HAS_BUILD=true
+            [ -f "$d/settings.gradle" ] || [ -f "$d/settings.gradle.kts" ] && HAS_SETTINGS=true
+            [ -d "$d/app" ] && HAS_APP=true
+          }
+
+          check_dir "."
+
+          if [ "$HAS_BUILD" = false ] && [ "$HAS_SETTINGS" = false ] && [ "$HAS_APP" = false ]; then
+            CANDIDATE=$(find . -maxdepth 2 -type f \( -name "build.gradle" -o -name "build.gradle.kts" -o -name "settings.gradle" -o -name "settings.gradle.kts" \) | head -1)
+            if [ -n "$CANDIDATE" ]; then
+              CANDIDATE_DIR=$(dirname "$CANDIDATE")
+              echo "📁 Coba root alternatif: $CANDIDATE_DIR"
+              WORKDIR="$CANDIDATE_DIR"
+              HAS_BUILD=false
+              HAS_SETTINGS=false
+              HAS_APP=false
+              check_dir "$WORKDIR"
+            fi
+          fi
+
+          if [ "$HAS_BUILD" = false ] && [ "$HAS_SETTINGS" = false ] && [ "$HAS_APP" = false ]; then
+            echo ""
+            echo "╔══════════════════════════════════════════════════════════════╗"
+            echo "║                                                              ║"
+            echo "║   ❌  ZIP TIDAK VALID — BUKAN PROJECT ANDROID                ║"
+            echo "║                                                              ║"
+            echo "╚══════════════════════════════════════════════════════════════╝"
+            echo ""
+            echo "📋 ZIP kamu WAJIB berisi minimal SALAH SATU dari:"
+            echo ""
+            echo "   1) build.gradle        atau  build.gradle.kts"
+            echo "   2) settings.gradle     atau  settings.gradle.kts"
+            echo "   3) folder 'app/'  yang berisi  app/build.gradle"
+            echo ""
+            echo "📁 Isi ZIP kamu saat ini:"
+            echo "---------------------------------------------"
+            find . -maxdepth 3 -type f 2>/dev/null | head -30
+            echo "---------------------------------------------"
+            echo ""
+            echo "💡 Tips:"
+            echo "   • Kalau project dari Android Studio:"
+            echo "     File → Export → Zip,  atau compress folder project"
+            echo "   • Pastikan file .gradle ada di root folder ZIP"
+            echo ""
+            exit 1
+          fi
+
+          echo ""
+          echo "✅ ZIP terdeteksi sebagai project Android"
+          echo "   ├─ build.gradle      : $HAS_BUILD"
+          echo "   ├─ settings.gradle   : $HAS_SETTINGS"
+          echo "   └─ folder 'app/'     : $HAS_APP"
+          echo ""
+
+          REL_ROOT=$(echo "$WORKDIR" | sed 's|^\./||;s|^\.$|.|')
+          echo "✅ Project root: $REL_ROOT"
+          echo "root=$REL_ROOT" >> $GITHUB_OUTPUT
+
+      # ============================================================
+      # PATCH / AUTO-CREATE FILE GRADLE YANG HILANG
+      # ============================================================
+      - name: Patch / Auto-create Gradle files
+        working-directory: project/${{ steps.detect.outputs.root }}
+        run: |
+          echo "🔍 Cek file Gradle..."
+
+          if [ ! -f "settings.gradle" ] && [ ! -f "settings.gradle.kts" ]; then
+            echo "📝 settings.gradle tidak ada, buat baru..."
+            cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "App"
+          include ':app'
+          EOF
+          fi
+
+          if [ -f "settings.gradle" ]; then
+            if ! grep -q "dependencyResolutionManagement" settings.gradle && \
+               ! grep -q "pluginManagement" settings.gradle; then
+              echo "📝 settings.gradle kurang repositories, patch..."
+              ROOT_NAME=$(grep -oP 'rootProject\.name\s*=\s*["\x27]\K[^"\x27]+' settings.gradle 2>/dev/null || echo "App")
+              cat > settings.gradle <<EOF
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "${ROOT_NAME}"
+          include ':app'
+          EOF
+            fi
+          fi
+
+          if [ ! -f "build.gradle" ] && [ ! -f "build.gradle.kts" ]; then
+            echo "📝 build.gradle root tidak ada, buat baru..."
+            cat > build.gradle <<'EOF'
+          buildscript {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+              dependencies {
+                  classpath 'com.android.tools.build:gradle:8.1.4'
+              }
+          }
+
+          allprojects {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          EOF
+          fi
+
+          if [ -f "build.gradle" ]; then
+            if ! grep -q "allprojects" build.gradle && \
+               ! grep -q "buildscript" build.gradle; then
+              echo "📝 build.gradle kurang repositories, patch..."
+              ORIGINAL=$(cat build.gradle)
+              cat > build.gradle <<EOF
+          buildscript {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+              dependencies {
+                  classpath 'com.android.tools.build:gradle:8.1.4'
+              }
+          }
+
+          allprojects {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          ${ORIGINAL}
+          EOF
+            fi
+          fi
+
+          if [ ! -d "app" ]; then
+            echo "⚠️ Warning: folder 'app/' tidak ditemukan!"
+            ls -la
+          fi
+
+          echo "✅ Patch selesai"
+          echo "===== settings.gradle ====="
+          cat settings.gradle 2>/dev/null || cat settings.gradle.kts 2>/dev/null || echo "(tidak ada)"
+          echo "===== build.gradle ====="
+          cat build.gradle 2>/dev/null || cat build.gradle.kts 2>/dev/null || echo "(tidak ada)"
+
+      # ============================================================
+      # ENSURE GRADLE WRAPPER
+      # ============================================================
+      - name: Ensure Gradle wrapper exists
+        working-directory: project/${{ steps.detect.outputs.root }}
+        run: |
+          if [ ! -f "gradlew" ]; then
+            echo "🔧 Generate gradle wrapper..."
+            mkdir -p gradle/wrapper
+
+            curl -fsSL "https://raw.githubusercontent.com/gradle/gradle/v8.2.1/gradle/wrapper/gradle-wrapper.jar" \
+              -o gradle/wrapper/gradle-wrapper.jar
+
+            cat > gradle/wrapper/gradle-wrapper.properties <<'EOF'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.2.1-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          EOF
+
+            cat > gradlew <<'GRADLEW'
+          #!/bin/sh
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          exec java -classpath "$DIR/gradle/wrapper/gradle-wrapper.jar" org.gradle.wrapper.GradleWrapperMain "$@"
+          GRADLEW
+
+            chmod +x gradlew
+          fi
+          echo "✅ Gradle wrapper siap"
+          ls -la gradlew gradle/wrapper/ || true
+
+      # ============================================================
+      # SETUP local.properties
+      # ============================================================
+      - name: Setup local.properties
+        working-directory: project/${{ steps.detect.outputs.root }}
+        run: |
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+          chmod +x gradlew || true
+          cat local.properties
+
+      # ============================================================
+      # APPLY CUSTOM ICON (opsional)
+      # ============================================================
+      - name: Apply custom icon
+        if: inputs.icon_url != ''
+        working-directory: project/${{ steps.detect.outputs.root }}
+        run: |
+          ICON_URL="${{ inputs.icon_url }}"
+          mkdir -p /tmp/icon
+
+          if ! curl -fsSL "$ICON_URL" -o /tmp/icon/original; then
+            echo "⚠️ Gagal download icon, skip"
+            exit 0
+          fi
+
+          convert /tmp/icon/original -resize 512x512! /tmp/icon/icon.png 2>/dev/null || \
+            cp /tmp/icon/original /tmp/icon/icon.png
+
+          convert /tmp/icon/icon.png -resize 340x340 -background none \
+            -gravity center -extent 512x512 /tmp/icon/foreground.png 2>/dev/null || \
+            cp /tmp/icon/icon.png /tmp/icon/foreground.png
+
+          convert -size 512x512 xc:white /tmp/icon/background.png 2>/dev/null || \
+            cp /tmp/icon/icon.png /tmp/icon/background.png
+
+          RES_DIR=$(find . -type d -path "*/src/main/res" | head -1)
+          if [ -z "$RES_DIR" ]; then
+            echo "⚠️ Gak nemu folder res, skip icon"
+            exit 0
+          fi
+          echo "📁 RES dir: $RES_DIR"
+
+          for density in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+            DIR="$RES_DIR/mipmap-$density"
+            mkdir -p "$DIR"
+            cp /tmp/icon/icon.png "$DIR/ic_launcher.png"
+            cp /tmp/icon/icon.png "$DIR/ic_launcher_round.png"
+            cp /tmp/icon/foreground.png "$DIR/ic_launcher_foreground.png"
+            cp /tmp/icon/background.png "$DIR/ic_launcher_background.png"
+          done
+
+          rm -rf "$RES_DIR/mipmap-anydpi-v26"
+          echo "🗑️ Adaptive XML dihapus"
+          echo "✅ Icon terpasang"
+
+      # ============================================================
+      # BUILD APK
+      # ============================================================
+      - name: Build APK
+        working-directory: project/${{ steps.detect.outputs.root }}
+        run: |
+          if [ "${{ inputs.build_type }}" = "release" ]; then
+            ./gradlew assembleRelease --no-daemon --stacktrace || {
+              echo "⚠️ Release gagal, fallback ke debug..."
+              ./gradlew assembleDebug --no-daemon --stacktrace
+            }
+          else
+            ./gradlew assembleDebug --no-daemon --stacktrace
+          fi
+
+      # ============================================================
+      # SIGN RELEASE APK (fallback ke debug keystore)
+      # ============================================================
+      - name: Sign Release APK
+        if: inputs.build_type == 'release'
+        working-directory: project/${{ steps.detect.outputs.root }}
+        run: |
+          RELEASE_APK=$(find . -type f -name "*release*.apk" | head -1)
+          if [ -z "$RELEASE_APK" ]; then
+            echo "⚠️ Release APK tidak ditemukan"
+            exit 0
+          fi
+
+          echo "📦 Release APK: $RELEASE_APK"
+
+          if [[ "$RELEASE_APK" != *"unsigned"* ]]; then
+            echo "✅ APK sudah signed, skip"
+            exit 0
+          fi
+
+          echo "🔏 APK unsigned, sign pakai debug keystore..."
+
+          DEBUG_KS="$HOME/.android/debug.keystore"
+          if [ ! -f "$DEBUG_KS" ]; then
+            mkdir -p "$HOME/.android"
+            keytool -genkey -v -keystore "$DEBUG_KS" \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US" 2>/dev/null
+          fi
+
+          APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -name "apksigner" | sort -r | head -1)
+          ZIPALIGN=$(find "$ANDROID_SDK_ROOT/build-tools" -name "zipalign" | sort -r | head -1)
+
+          "$ZIPALIGN" -f 4 "$RELEASE_APK" "${RELEASE_APK}.aligned"
+          mv "${RELEASE_APK}.aligned" "$RELEASE_APK"
+
+          "$APKSIGNER" sign \
+            --ks "$DEBUG_KS" \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --ks-key-alias androiddebugkey \
+            "$RELEASE_APK"
+
+          echo "✅ APK signed"
+          "$APKSIGNER" verify "$RELEASE_APK" || true
+
+      # ============================================================
+      # COLLECT & RENAME APK
+      # ============================================================
+      - name: Collect APK
+        run: |
+          mkdir -p output
+          find project -type f -name "*.apk" -exec cp {} output/ \;
+          echo "📦 APK ditemukan:"
+          ls -lh output/
+
+          if [ ! "$(ls -A output)" ]; then
+            echo "❌ Tidak ada APK dihasilkan!"
+            exit 1
+          fi
+
+      - name: Rename APK
+        run: |
+          cd output
+          for f in *.apk; do
+            mv "$f" "${{ inputs.tag }}-$f"
+          done
+          ls -lh
+
+      # ============================================================
+      # UPLOAD ARTIFACT
+      # ============================================================
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.tag }}
+          path: output/*.apk
+          retention-days: 7
